@@ -10,5 +10,11 @@
     "folder": "diffusion_models",
     "name": "anima-base-v1.0.safetensors",
     "auto": true
+  },
+  {
+    "url": "https://civitai.red/api/download/models/2945208?fileId=2824385",
+    "folder": "vae",
+    "name": "qwen_image_vae.safetensors",
+    "auto": true
   }
 ]
