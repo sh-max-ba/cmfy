@@ -16,5 +16,11 @@
     "folder": "vae",
     "name": "qwen_image_vae.safetensors",
     "auto": true
+  },
+  {
+    "url": "https://civitai.com/api/download/models/2911835?fileId=2789897",
+    "folder": "vae",
+    "name": "Valbun_Style",
+    "auto": false
   }
 ]
