@@ -24,7 +24,7 @@ apt-get update -qq && apt-get install -y -qq aria2 || true
 # --- 2. Скачиваем установщик ----------------------------------------------
 echo "[2/4] Скачивание model_downloader.py..."
 # ЗАМЕНИ ЭТУ ССЫЛКУ на свой raw-URL (GitHub / Gist):
-DOWNLOADER_URL="https://raw.githubusercontent.com/sh-max-ba/cmfy/main/model_downloader.py"
+DOWNLOADER_URL="https://raw.githubusercontent.com/sh-max-ba/cmfy/refs/heads/main/model_downloader.py"
 
 mkdir -p /opt/downloader
 if curl -fsSL "$DOWNLOADER_URL" -o /opt/downloader/model_downloader.py; then
@@ -36,10 +36,27 @@ fi
 
 # --- 3. supervisor: автозапуск установщика --------------------------------
 echo "[3/4] Регистрация в supervisor..."
+
+# Пишем окружение в отдельный файл из ТЕКУЩИХ переменных (надёжнее, чем
+# %(ENV_..)s в supervisor, который видит не все переменные инстанса).
+cat > /opt/downloader/env.sh <<EOF
+export DOWNLOADER_PORT="${DOWNLOADER_PORT}"
+export COMFYUI_PATH="${COMFY}"
+export CIVITAI_TOKEN="${CIVITAI_TOKEN:-}"
+export HF_TOKEN="${HF_TOKEN:-}"
+EOF
+
+# Запускаем через обёртку, которая сначала подгружает env.sh.
+cat > /opt/downloader/run.sh <<'EOF'
+#!/usr/bin/env bash
+source /opt/downloader/env.sh
+exec python3 /opt/downloader/model_downloader.py
+EOF
+chmod +x /opt/downloader/run.sh
+
 cat > /etc/supervisor/conf.d/model-downloader.conf <<EOF
 [program:model-downloader]
-command=python3 /opt/downloader/model_downloader.py
-environment=DOWNLOADER_PORT="${DOWNLOADER_PORT}",COMFYUI_PATH="${COMFY}",CIVITAI_TOKEN="%(ENV_CIVITAI_TOKEN)s",HF_TOKEN="%(ENV_HF_TOKEN)s"
+command=/opt/downloader/run.sh
 autostart=true
 autorestart=true
 stdout_logfile=/var/log/model-downloader.log
