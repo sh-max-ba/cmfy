@@ -7,10 +7,13 @@ Model Downloader — web-установщик моделей для ComfyUI на
   - прогресс-бар со скоростью и ETA (парсится из aria2c)
   - отмена активной загрузки
   - список уже скачанного
+  - избранное в GitHub (★) + автокачка при старте
+  - бэкап воркфлоу ComfyUI в GitHub
 
 Запуск:  python3 model_downloader.py
 Порт:    7000 (DOWNLOADER_PORT)
 Токены:  CIVITAI_TOKEN, HF_TOKEN (из окружения)
+GitHub:  GITHUB_TOKEN, GITHUB_REPO, GITHUB_BRANCH (для избранного/воркфлоу)
 """
 
 import os
@@ -42,6 +45,164 @@ KNOWN_FOLDERS = [
 JOBS = {}
 JOB_LOCK = threading.Lock()
 _job_counter = 0
+
+
+# --- GitHub: хранилище избранного и воркфлоу --------------------------------
+#
+# Конфиг через окружение:
+#   GITHUB_TOKEN  - fine-grained PAT, права Contents: read/write на репо
+#   GITHUB_REPO   - "owner/repo", напр. "sh-max-ba/cmfy"
+#   GITHUB_BRANCH - ветка (по умолчанию main)
+#
+# Файлы в репо:
+#   favorites.json                 - список избранных моделей
+#   workflows/<имя>.json           - бэкапы воркфлоу ComfyUI
+
+import os
+import json
+import base64
+import urllib.request
+import urllib.error
+
+GH_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GH_REPO = os.environ.get("GITHUB_REPO", "")
+GH_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
+FAVORITES_PATH = "favorites.json"
+WORKFLOWS_DIR_REPO = "workflows"
+
+
+def gh_enabled():
+    return bool(GH_TOKEN and GH_REPO)
+
+
+def _gh_request(method, path, body=None):
+    """Запрос к GitHub Contents API. path относительный (favorites.json и т.п.)."""
+    url = f"https://api.github.com/repos/{GH_REPO}/contents/{path}"
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", f"Bearer {GH_TOKEN}")
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("User-Agent", "model-downloader")
+    if data:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode()), None
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None, 404
+        return None, f"{e.code} {e.read().decode()[:200]}"
+    except Exception as e:
+        return None, str(e)
+
+
+def _gh_get_file(path):
+    """Возвращает (content_str, sha) или (None, None) если файла нет."""
+    res, err = _gh_request("GET", f"{path}?ref={GH_BRANCH}")
+    if err == 404 or res is None:
+        return None, None
+    content = base64.b64decode(res["content"]).decode()
+    return content, res["sha"]
+
+
+def _gh_put_file(path, content_str, message):
+    """Создаёт/обновляет файл. Возвращает (ok, error)."""
+    _, sha = _gh_get_file(path)
+    body = {
+        "message": message,
+        "content": base64.b64encode(content_str.encode()).decode(),
+        "branch": GH_BRANCH,
+    }
+    if sha:
+        body["sha"] = sha
+    res, err = _gh_request("PUT", path, body)
+    return (res is not None and err is None), err
+
+
+# --- Избранное --------------------------------------------------------------
+
+def load_favorites():
+    """Список избранных моделей из репо. Пустой список, если нет/не настроено."""
+    if not gh_enabled():
+        return []
+    content, _ = _gh_get_file(FAVORITES_PATH)
+    if not content:
+        return []
+    try:
+        data = json.loads(content)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def add_favorite(item):
+    """item = {url, folder, name, auto}. Дедуп по url+folder."""
+    if not gh_enabled():
+        return False, "GitHub не настроен (GITHUB_TOKEN/GITHUB_REPO)"
+    favs = load_favorites()
+    key = (item.get("url"), item.get("folder"))
+    favs = [f for f in favs if (f.get("url"), f.get("folder")) != key]
+    favs.append({
+        "url": item.get("url", ""),
+        "folder": item.get("folder", "loras"),
+        "name": item.get("name", ""),
+        "auto": bool(item.get("auto", True)),
+    })
+    return _gh_put_file(
+        FAVORITES_PATH, json.dumps(favs, ensure_ascii=False, indent=2),
+        f"add favorite: {item.get('name') or item.get('url')}"
+    )
+
+
+def remove_favorite(url, folder):
+    if not gh_enabled():
+        return False, "GitHub не настроен"
+    favs = load_favorites()
+    favs = [f for f in favs if not (f.get("url") == url and f.get("folder") == folder)]
+    return _gh_put_file(
+        FAVORITES_PATH, json.dumps(favs, ensure_ascii=False, indent=2),
+        "remove favorite"
+    )
+
+
+# --- Воркфлоу ---------------------------------------------------------------
+
+def backup_workflows(comfy_path):
+    """Заливает все локальные воркфлоу ComfyUI в репо. Возвращает (count, errors)."""
+    if not gh_enabled():
+        return 0, ["GitHub не настроен"]
+    wf_dir = os.path.join(comfy_path, "user", "default", "workflows")
+    if not os.path.isdir(wf_dir):
+        return 0, ["Папка воркфлоу не найдена"]
+    count, errors = 0, []
+    for fn in os.listdir(wf_dir):
+        if not fn.endswith(".json"):
+            continue
+        fp = os.path.join(wf_dir, fn)
+        try:
+            with open(fp, encoding="utf-8") as f:
+                content = f.read()
+            ok, err = _gh_put_file(
+                f"{WORKFLOWS_DIR_REPO}/{fn}", content, f"backup workflow {fn}"
+            )
+            if ok:
+                count += 1
+            else:
+                errors.append(f"{fn}: {err}")
+        except Exception as e:
+            errors.append(f"{fn}: {e}")
+    return count, errors
+
+
+def list_repo_workflows():
+    """Имена воркфлоу, лежащих в репо."""
+    if not gh_enabled():
+        return []
+    res, err = _gh_request("GET", f"{WORKFLOWS_DIR_REPO}?ref={GH_BRANCH}")
+    if err or not isinstance(res, list):
+        return []
+    return [f["name"] for f in res if f.get("name", "").endswith(".json")]
+
 
 
 # --- Папки ------------------------------------------------------------------
@@ -381,14 +542,37 @@ HTML = r"""<!DOCTYPE html>
     <label>Имя файла (необязательно)</label>
     <input id="name" placeholder="оставь пустым — определит сам">
 
-    <button class="btn-go" id="go" onclick="start()">Скачать</button>
+    <div style="display:flex; gap:10px; margin-top:18px;">
+      <button class="btn-go" id="go" onclick="start()" style="margin-top:0; flex:2;">Скачать</button>
+      <button id="star" onclick="addFav()" style="flex:1; background:#2d2820; color:#e8c14e;" title="Добавить в избранное (GitHub)">★ В избранное</button>
+    </div>
     <div class="token-note">
       Токены — civitai: <span id="cv"></span> · HuggingFace: <span id="hf"></span>
-      &nbsp;(env: CIVITAI_TOKEN, HF_TOKEN)
+      &nbsp;·&nbsp; GitHub: <span id="gh"></span>
     </div>
   </div>
 
   <div id="jobs"></div>
+
+  <div class="card" id="fav-card">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <h3 style="margin:0;">★ Избранное <span id="fav-repo" style="color:#5a616c; text-transform:none; font-weight:400;"></span></h3>
+      <button onclick="loadFav()" class="btn-del" style="color:#7b818c;">обновить</button>
+    </div>
+    <div style="font-size:12px; color:#6b7280; margin:4px 0 0;">
+      Модели с флагом <b style="color:#5fd98a;">auto</b> качаются автоматически при старте нового инстанса.
+    </div>
+    <div id="fav-list" style="margin-top:10px;">загрузка…</div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin:0 0 8px;">Воркфлоу</h3>
+    <div style="font-size:12px; color:#6b7280; margin-bottom:10px;">
+      Сохранить все воркфлоу ComfyUI в GitHub. При старте нового инстанса они восстановятся.
+    </div>
+    <button onclick="backupWf()" id="wf-btn" style="background:#1e2a20; color:#5fd98a;">Сохранить воркфлоу в GitHub</button>
+    <div id="wf-status" style="font-size:12px; color:#8b909a; margin-top:8px;"></div>
+  </div>
 
   <details>
     <summary>Что уже скачано на сервере</summary>
@@ -499,8 +683,86 @@ async function del(folder, name) {
   loadInstalled();
 }
 
+// --- Избранное ---
+async function addFav() {
+  const url = document.getElementById('url').value.trim();
+  const newf = document.getElementById('newfolder').value.trim();
+  const folder = newf || document.getElementById('folder').value;
+  const name = document.getElementById('name').value.trim();
+  if (!url) { alert('Вставь ссылку'); return; }
+  const auto = confirm('Качать автоматически при старте нового инстанса?\n\nOK = да (auto), Отмена = нет');
+  const btn = document.getElementById('star');
+  btn.disabled = true;
+  const r = await fetch('/fav/add', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({url, folder, name, auto})});
+  const d = await r.json();
+  btn.disabled = false;
+  if (!d.ok) alert('Не удалось добавить: ' + (d.error || 'GitHub не настроен'));
+  loadFav();
+}
+
+async function loadFav() {
+  const r = await fetch('/favorites');
+  const d = await r.json();
+  document.getElementById('gh').innerHTML = d.enabled
+    ? '<span class="ok">подключён</span>' : '<span class="no">нет (GITHUB_TOKEN)</span>';
+  document.getElementById('fav-repo').textContent = d.repo ? '· ' + d.repo : '';
+  const star = document.getElementById('star');
+  if (!d.enabled) {
+    star.disabled = true;
+    document.getElementById('fav-list').innerHTML =
+      '<div class="sub">GitHub не настроен. Задай GITHUB_TOKEN и GITHUB_REPO в Environment Variables.</div>';
+    return;
+  }
+  const favs = d.favorites || [];
+  if (!favs.length) {
+    document.getElementById('fav-list').innerHTML = '<div class="sub">Пусто. Добавь модель кнопкой ★</div>';
+    return;
+  }
+  document.getElementById('fav-list').innerHTML = '<table>' + favs.map(f => `
+    <tr>
+      <td>${f.name || f.url.split('/').pop()}
+        ${f.auto ? '<span class="badge done" style="margin-left:6px;">auto</span>' : ''}
+        <div class="meta">${f.folder} · ${f.url}</div></td>
+      <td class="act" style="width:auto; white-space:nowrap;">
+        <button class="btn-del" style="color:#60a5fa;"
+          onclick='favDl(${JSON.stringify(f)})'>скачать</button>
+        <button class="btn-del"
+          onclick="favRm('${f.url.replace(/'/g,"\\'")}','${f.folder}')">✕</button>
+      </td>
+    </tr>`).join('') + '</table>';
+}
+
+async function favDl(f) {
+  await fetch('/fav/download', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(f)});
+  poll();
+}
+
+async function favRm(url, folder) {
+  if (!confirm('Убрать из избранного?')) return;
+  await fetch('/fav/remove', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({url, folder})});
+  loadFav();
+}
+
+// --- Воркфлоу ---
+async function backupWf() {
+  const btn = document.getElementById('wf-btn');
+  const st = document.getElementById('wf-status');
+  btn.disabled = true; st.textContent = 'Сохраняю…';
+  const r = await fetch('/workflows/backup', {method:'POST'});
+  const d = await r.json();
+  btn.disabled = false;
+  if (d.errors && d.errors.length)
+    st.innerHTML = `Сохранено: ${d.count}. <span class="no">Ошибки: ${d.errors.join('; ')}</span>`;
+  else
+    st.innerHTML = `<span class="ok">Сохранено воркфлоу: ${d.count}</span>`;
+}
+
 loadFolders();
 poll();
+loadFav();
 </script>
 </body>
 </html>"""
@@ -538,6 +800,17 @@ class Handler(BaseHTTPRequestHandler):
             }))
         elif self.path == "/installed":
             self._send(200, json.dumps(list_models()))
+        elif self.path == "/favorites":
+            self._send(200, json.dumps({
+                "enabled": gh_enabled(),
+                "repo": GH_REPO,
+                "favorites": load_favorites(),
+            }))
+        elif self.path == "/workflows":
+            self._send(200, json.dumps({
+                "enabled": gh_enabled(),
+                "repo": list_repo_workflows(),
+            }))
         else:
             self._send(404, json.dumps({"error": "not found"}))
 
@@ -560,6 +833,27 @@ class Handler(BaseHTTPRequestHandler):
                 p = self._read_json()
                 ok = delete_model(p.get("folder"), p.get("name"))
                 self._send(200, json.dumps({"deleted": ok}))
+            elif self.path == "/fav/add":
+                p = self._read_json()
+                ok, err = add_favorite(p)
+                self._send(200, json.dumps({"ok": ok, "error": err}))
+            elif self.path == "/fav/remove":
+                p = self._read_json()
+                ok, err = remove_favorite(p.get("url"), p.get("folder"))
+                self._send(200, json.dumps({"ok": ok, "error": err}))
+            elif self.path == "/fav/download":
+                # скачать одну модель из избранного (по url+folder+name)
+                p = self._read_json()
+                url = (p.get("url") or "").strip()
+                folder = safe_folder(p.get("folder") or "loras")
+                name = (p.get("name") or "").strip() or None
+                if not url:
+                    self._send(400, json.dumps({"error": "no url"})); return
+                jid = start_job(url, folder, name)
+                self._send(200, json.dumps({"job_id": jid}))
+            elif self.path == "/workflows/backup":
+                count, errors = backup_workflows(COMFY)
+                self._send(200, json.dumps({"count": count, "errors": errors}))
             else:
                 self._send(404, json.dumps({"error": "not found"}))
         except Exception as e:
