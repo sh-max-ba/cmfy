@@ -24,7 +24,7 @@ apt-get update -qq && apt-get install -y -qq aria2 || true
 # --- 2. Скачиваем установщик ----------------------------------------------
 echo "[2/4] Скачивание model_downloader.py..."
 # ЗАМЕНИ ЭТУ ССЫЛКУ на свой raw-URL (GitHub / Gist):
-DOWNLOADER_URL="https://raw.githubusercontent.com/ТВОЙ_ЛОГИН/ТВОЙ_РЕПО/main/model_downloader.py"
+DOWNLOADER_URL="https://raw.githubusercontent.com/sh-max-ba/cmfy/main/model_downloader.py"
 
 mkdir -p /opt/downloader
 if curl -fsSL "$DOWNLOADER_URL" -o /opt/downloader/model_downloader.py; then
